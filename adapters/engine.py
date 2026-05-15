@@ -66,7 +66,7 @@ class Engine:
             # Resolve all canonical_ids and prepare batch insert rows
             batch_rows: list[tuple] = []
             for event in other_events:
-                service = event.get("service", event.get("svc", ""))
+                service = event.get("service", event.get("svc", event.get("target", "")))
                 if not service:
                     continue
                 cid = self.resolver.resolve(service)
@@ -82,7 +82,7 @@ class Engine:
 
             # Process graph/motif updates (non-storage logic)
             for event in other_events:
-                service = event.get("service", event.get("svc", ""))
+                service = event.get("service", event.get("svc", event.get("target", "")))
                 if not service:
                     continue
                 cid = self.resolver.resolve(service)
@@ -102,17 +102,23 @@ class Engine:
         if not mutation:
             mutation = event
 
-        kind = mutation.get("kind", mutation.get("type", ""))
+        if isinstance(mutation, str):
+            kind = mutation
+            mutation_dict = event
+        else:
+            kind = mutation.get("kind", mutation.get("type", ""))
+            mutation_dict = mutation
+
         ts = event.get("ts", "")
 
         if kind == "rename" or "rename" in str(mutation):
-            old_name = mutation.get("old_name", mutation.get("from", ""))
-            new_name = mutation.get("new_name", mutation.get("to", ""))
+            old_name = mutation_dict.get("old_name", mutation_dict.get("from", mutation_dict.get("from_", "")))
+            new_name = mutation_dict.get("new_name", mutation_dict.get("to", ""))
             if old_name and new_name:
                 self.resolver.rename(old_name, new_name, ts)
-        elif kind in ("dep_add", "dep_remove", "dependency"):
-            src = mutation.get("src", mutation.get("source", ""))
-            dst = mutation.get("dst", mutation.get("target", ""))
+        elif kind in ("dep_add", "dep_remove", "dependency", "dep_shift"):
+            src = mutation_dict.get("src", mutation_dict.get("source", ""))
+            dst = mutation_dict.get("dst", mutation_dict.get("target", ""))
             if src:
                 self.resolver.resolve(src)
             if dst:
@@ -134,7 +140,7 @@ class Engine:
     def _process_event(self, event: dict) -> None:
         """Process a non-topology event."""
         kind = event.get("kind", "")
-        service = event.get("service", event.get("svc", ""))
+        service = event.get("service", event.get("svc", event.get("target", "")))
 
         if not service:
             return  # Skip events without a service identifier
@@ -304,17 +310,17 @@ class Engine:
     ) -> dict:
         """
         Reconstruct context for an incident signal.
-        Reads are concurrent-safe with the append-only store.
-        No lock needed here.
+        Added lock to ensure thread safety with NetworkX and DuckDB concurrent accesses.
         """
-        return self.assembler.assemble(
-            signal=signal,
-            mode=mode,
-            resolver=self.resolver,
-            event_store=self.store,
-            graph=self.graph,
-            motif_index=self.motifs,
-        )
+        with self._lock:
+            return self.assembler.assemble(
+                signal=signal,
+                mode=mode,
+                resolver=self.resolver,
+                event_store=self.store,
+                graph=self.graph,
+                motif_index=self.motifs,
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle

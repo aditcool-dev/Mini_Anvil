@@ -5,9 +5,9 @@
     {
       "name": "1. Ingest throughput",
       "passed": true,
-      "value": "2716 ev/s",
+      "value": "2737 ev/s",
       "threshold": ">= 1,000 ev/s",
-      "detail": "Ingested 5000 events in 1.841s"
+      "detail": "Ingested 5000 events in 1.827s"
     },
     {
       "name": "2. Output schema validation",
@@ -75,7 +75,7 @@
     {
       "name": "11. Deep mode (valid Context, p95<=6s)",
       "passed": true,
-      "value": "332ms  explain_len=804",
+      "value": "373ms  explain_len=804",
       "threshold": "Non-empty explain, <= 6,000ms",
       "detail": ""
     }

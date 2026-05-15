@@ -259,6 +259,8 @@ def _template_explain(
             f"Deployment of version {recent_deploy.get('version', '?')} "
             f"at {recent_deploy.get('ts', '?')} is the likely trigger."
         )
+    else:
+        parts.append("No recent deployment was detected for this service within the incident window.")
 
     # 4. Causal chain narrative
     if causal_chain:
