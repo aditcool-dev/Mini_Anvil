@@ -375,7 +375,7 @@ class OperationalGraph:
 
         # Build causal shape as (src_role, relation_role, dst_role) triples
         # This is the key discriminator between incident families
-        motif.causal_shape = [
+        shape_triples = [
             (
                 cid_roles.get(e.src_cid, "UNKNOWN"),
                 _relation_to_role(e.relation),
@@ -383,6 +383,24 @@ class OperationalGraph:
             )
             for e in edges
         ]
+
+        # Add structural arity tokens — discriminate families by graph structure
+        # (number of unique services, number of causal edges, whether self-loops exist)
+        n_nodes = len(motif.canonical_ids)
+        n_edges = len(edges)
+        has_self_loop = any(e.src_cid == e.dst_cid for e in edges)
+        # Bin node count: "solo", "pair", "trio", "multi"
+        node_bin = "solo" if n_nodes <= 1 else "pair" if n_nodes == 2 else "trio" if n_nodes == 3 else "multi"
+        # Bin edge count: "sparse", "moderate", "dense"
+        edge_bin = "sparse" if n_edges <= 2 else "moderate" if n_edges <= 5 else "dense"
+
+        arity_tokens = [
+            ("ARITY", f"nodes_{node_bin}", "ARITY"),
+            ("ARITY", f"edges_{edge_bin}", "ARITY"),
+            ("ARITY", f"self_loop_{'yes' if has_self_loop else 'no'}", "ARITY"),
+        ]
+
+        motif.causal_shape = shape_triples + arity_tokens
 
         motif.confidence = (
             sum(e.confidence for e in edges) / len(edges) if edges else 0.0

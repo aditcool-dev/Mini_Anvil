@@ -151,6 +151,7 @@ def _compute_similarity(
     # 4. Sequence order similarity bonus — penalize if order is very different
     order_bonus = _sequence_order_similarity(query.event_sequence, stored.event_sequence)
 
+    # Weights: shape is the primary discriminator, action_match is a strong hard bonus
     score = 0.45 * shape_sim + 0.30 * seq_sim + 0.15 * action_match + 0.10 * order_bonus
 
     # Build rationale
