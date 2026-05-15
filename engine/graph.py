@@ -95,8 +95,9 @@ class OperationalGraph:
         if not _NX_AVAILABLE:
             raise ImportError("networkx is required: pip install networkx")
         self.G: nx.DiGraph = nx.DiGraph()
-        self._deploy_log: dict[str, list[dict]] = {}   # cid → [{ts, version}]
-        self._remediation_table: dict[str, list[dict]] = {}  # cid → [outcomes]
+        self._deploy_log: dict[str, list[dict]] = {}        # cid → [{ts, version}]
+        self._remediation_table: dict[str, list[dict]] = {} # cid → [outcomes]
+        self._signal_log: dict[str, dict[str, dict]] = {}   # cid → {kind → {ts, trace_id, event_id}}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -179,17 +180,26 @@ class OperationalGraph:
     def reinforce_remediation(self, cid: str, event: dict) -> None:
         """
         Called when remediation event arrives with outcome=resolved.
-        Boosts confidence of all edges in the 10-minute window before remediation.
+        Boosts confidence of ALL edges involving cid that were active during
+        the incident window (first_seen <= remediation_ts).
+        Uses first_seen (not last_seen) so edges formed after the incident
+        start are still captured.
         """
         anchor_ts = event.get("ts", "")
+        try:
+            anchor = _parse_ts(anchor_ts)
+        except Exception:
+            return
+
         with self._lock:
             for src, dst, data in self.G.edges(data=True):
                 if src == cid or dst == cid:
                     try:
-                        last_seen = _parse_ts(data.get("last_seen", ""))
-                        anchor = _parse_ts(anchor_ts)
-                        delta = (anchor - last_seen).total_seconds()
-                        if 0 <= delta <= 600:
+                        # Boost if the edge was first observed before the remediation
+                        # and within a 20-minute lookback window
+                        first_seen = _parse_ts(data.get("first_seen", anchor_ts))
+                        delta = (anchor - first_seen).total_seconds()
+                        if -60 <= delta <= 1200:   # -60s tolerance for clock skew
                             data["confidence"] = min(0.95, data["confidence"] + 0.10)
                             data["remediation_reinforced"] = True
                     except Exception:
@@ -211,6 +221,34 @@ class OperationalGraph:
         return list(self._remediation_table.get(cid, []))
 
     # ------------------------------------------------------------------
+    # Signal tracking (for cross-signal edge formation)
+    # ------------------------------------------------------------------
+
+    def record_signal(self, cid: str, kind: str, ts: str,
+                      trace_id: str | None, event_id: str) -> None:
+        """Track the most recent signal of each kind per entity."""
+        with self._lock:
+            if cid not in self._signal_log:
+                self._signal_log[cid] = {}
+            self._signal_log[cid][kind] = {"ts": ts, "trace_id": trace_id, "event_id": event_id}
+
+    def get_recent_signal(self, cid: str, anchor_ts: str,
+                          kind: str, window_s: int = 300) -> dict | None:
+        """Return the most recent signal of a given kind for cid within window."""
+        entry = self._signal_log.get(cid, {}).get(kind)
+        if not entry:
+            return None
+        try:
+            anchor = _parse_ts(anchor_ts)
+            sig_ts = _parse_ts(entry["ts"])
+            delta = (anchor - sig_ts).total_seconds()
+            if 0 < delta <= window_s:
+                return entry
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------
     # Graph traversal
     # ------------------------------------------------------------------
 
@@ -221,11 +259,13 @@ class OperationalGraph:
         min_confidence: float = 0.3,
     ) -> list[CausalEdge]:
         """
-        BFS from cid, prune by confidence threshold.
+        BFS from cid, traversing both outgoing AND incoming edges.
+        Prune by confidence threshold.
         Returns ordered list of CausalEdge (source-precedes-effect).
         """
         visited: set[str] = set()
         queue: list[tuple[str, int]] = [(cid, 0)]
+        edges_seen: set[tuple] = set()
         edges: list[CausalEdge] = []
 
         with self._lock:
@@ -235,24 +275,46 @@ class OperationalGraph:
                     continue
                 visited.add(node)
 
-                for src, dst, data in self.G.edges(node, data=True):
+                # Outgoing edges: node → dst (node caused dst)
+                for src, dst, data in self.G.out_edges(node, data=True):
                     if data.get("confidence", 0) < min_confidence:
                         continue
-                    edges.append(CausalEdge(
-                        src_cid=src,
-                        dst_cid=dst,
-                        relation=data.get("relation", ""),
-                        confidence=data.get("confidence", 0.0),
-                        count=data.get("count", 1),
-                        first_seen=data.get("first_seen", ""),
-                        last_seen=data.get("last_seen", ""),
-                        evidence_ids=list(data.get("evidence_ids", [])),
-                    ))
+                    key = (src, dst)
+                    if key not in edges_seen:
+                        edges_seen.add(key)
+                        edges.append(CausalEdge(
+                            src_cid=src, dst_cid=dst,
+                            relation=data.get("relation", ""),
+                            confidence=data.get("confidence", 0.0),
+                            count=data.get("count", 1),
+                            first_seen=data.get("first_seen", ""),
+                            last_seen=data.get("last_seen", ""),
+                            evidence_ids=list(data.get("evidence_ids", [])),
+                        ))
                     if dst not in visited:
                         queue.append((dst, depth + 1))
 
-        # Sort by last_seen to enforce temporal ordering in output
-        edges.sort(key=lambda e: e.last_seen)
+                # Incoming edges: src → node (src caused node)
+                for src, dst, data in self.G.in_edges(node, data=True):
+                    if data.get("confidence", 0) < min_confidence:
+                        continue
+                    key = (src, dst)
+                    if key not in edges_seen:
+                        edges_seen.add(key)
+                        edges.append(CausalEdge(
+                            src_cid=src, dst_cid=dst,
+                            relation=data.get("relation", ""),
+                            confidence=data.get("confidence", 0.0),
+                            count=data.get("count", 1),
+                            first_seen=data.get("first_seen", ""),
+                            last_seen=data.get("last_seen", ""),
+                            evidence_ids=list(data.get("evidence_ids", [])),
+                        ))
+                    if src not in visited:
+                        queue.append((src, depth + 1))
+
+        # Sort by first_seen to enforce temporal ordering in output
+        edges.sort(key=lambda e: e.first_seen)
         return edges
 
     def get_edges_in_window(
@@ -358,6 +420,7 @@ class OperationalGraph:
                 "graph": self.G,
                 "deploy_log": self._deploy_log,
                 "remediation_table": self._remediation_table,
+                "signal_log": self._signal_log,
             }, f)
 
     def load(self, path: str) -> None:
@@ -366,6 +429,7 @@ class OperationalGraph:
         self.G = data["graph"]
         self._deploy_log = data.get("deploy_log", {})
         self._remediation_table = data.get("remediation_table", {})
+        self._signal_log = data.get("signal_log", {})
 
 
 # ------------------------------------------------------------------

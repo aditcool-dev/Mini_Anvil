@@ -184,27 +184,62 @@ class Engine:
 
     def _on_signal(self, event: dict, cid: str) -> None:
         """
-        Process metric/log/trace signals.
-        If a recent deploy exists for this entity, add deploy→signal causal edge.
-        For traces, correlate spans to build upstream call edges.
+        Process metric/log/trace signals. Builds causal edges:
+
+        1. deploy → signal  (if a recent deploy exists for this entity)
+        2. metric → log     (if an error log follows a metric anomaly on same entity)
+        3. log → trace      (if a log and trace share a trace_id on same entity)
+        4. caller → callee  (upstream call edges from trace spans)
         """
         ts = event.get("ts", "")
         kind = event.get("kind", "signal")
+        eid = event.get("event_id") or event.get("id") or ts
+        trace_id = event.get("trace_id")
 
-        # Check: does this signal follow a recent deploy for cid?
+        # Track signal timestamps FIRST so cross-signal lookups work correctly
+        self.graph.record_signal(cid, kind, ts, trace_id, eid)
+
+        # 1. deploy → signal edge
         recent_deploy = self.graph.get_recent_deploy(cid, ts, window_s=600)
         if recent_deploy:
             self.graph.add_edge(
                 src_cid=cid,
                 dst_cid=cid,
                 relation=f"deploy_to_{kind}",
-                evidence_id=event.get("trace_id") or event.get("event_id") or ts,
+                evidence_id=trace_id or eid,
                 ts_src=recent_deploy["ts"],
                 ts_dst=ts,
             )
 
-        # Trace correlation: spans sharing trace_id → upstream call edges
-        if event.get("trace_id") and kind == "trace":
+        # 2. metric → log: if this is an error log, link from the most recent
+        #    metric anomaly on the same entity (within 5 minutes)
+        if kind == "log" and event.get("level") in ("error", "critical", "fatal"):
+            recent_metric = self.graph.get_recent_signal(cid, ts, kind="metric", window_s=300)
+            if recent_metric:
+                self.graph.add_edge(
+                    src_cid=cid,
+                    dst_cid=cid,
+                    relation="metric_to_error_log",
+                    evidence_id=eid,
+                    ts_src=recent_metric["ts"],
+                    ts_dst=ts,
+                )
+
+        # 3. log → trace: if this trace shares a trace_id with a prior log on same entity
+        if kind == "trace" and trace_id:
+            recent_log = self.graph.get_recent_signal(cid, ts, kind="log", window_s=300)
+            if recent_log and recent_log.get("trace_id") == trace_id:
+                self.graph.add_edge(
+                    src_cid=cid,
+                    dst_cid=cid,
+                    relation="log_to_trace",
+                    evidence_id=trace_id,
+                    ts_src=recent_log["ts"],
+                    ts_dst=ts,
+                )
+
+        # 4. Trace spans → upstream call edges (caller → callee)
+        if trace_id and kind == "trace":
             for span in event.get("spans", []):
                 span_svc = span.get("svc", span.get("service", ""))
                 if not span_svc:
@@ -212,29 +247,18 @@ class Engine:
                 span_cid = self.resolver.resolve(span_svc)
                 if span_cid != cid:
                     span_ts = span.get("ts", ts)
-                    # Ensure temporal ordering
+                    # caller (cid) → callee (span_cid)
                     self.graph.add_edge(
                         src_cid=cid,
                         dst_cid=span_cid,
                         relation="upstream_call",
-                        evidence_id=event["trace_id"],
+                        evidence_id=trace_id,
                         ts_src=ts,
                         ts_dst=span_ts if span_ts > ts else ts,
                     )
 
-        # Log error signals: if error level, add signal→incident edge candidate
-        if kind == "log" and event.get("level") in ("error", "critical", "fatal"):
-            # Check if there's an open incident for this entity
-            for inc_id, inc in self._open_incidents.items():
-                if inc.get("cid") == cid:
-                    self.graph.add_edge(
-                        src_cid=cid,
-                        dst_cid=cid,
-                        relation="error_log_during_incident",
-                        evidence_id=event.get("event_id") or ts,
-                        ts_src=ts,
-                        ts_dst=inc.get("ts", ts),
-                    )
+        # Track signal timestamps for cross-signal edge formation
+        self.graph.record_signal(cid, kind, ts, trace_id, eid)
 
     def _on_incident(self, event: dict, cid: str) -> None:
         """Open an incident window for this entity."""

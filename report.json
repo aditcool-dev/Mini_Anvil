@@ -1,13 +1,13 @@
 {
   "adapter": "adapters.engine:Engine",
-  "quick": true,
+  "quick": false,
   "checks": [
     {
       "name": "1. Ingest throughput",
       "passed": true,
-      "value": "1264 ev/s",
+      "value": "2716 ev/s",
       "threshold": ">= 1,000 ev/s",
-      "detail": "Ingested 1000 events in 0.791s"
+      "detail": "Ingested 5000 events in 1.841s"
     },
     {
       "name": "2. Output schema validation",
@@ -26,14 +26,14 @@
     {
       "name": "4. Temporal ordering (cause_ts < effect_ts)",
       "passed": true,
-      "value": "0 violations in 1 edges",
+      "value": "0 violations in 2 edges",
       "threshold": "0 violations",
       "detail": ""
     },
     {
       "name": "5. Fast mode p95 latency",
       "passed": true,
-      "value": "p95=3ms  p50=1ms  (20 calls)",
+      "value": "p95=3ms  p50=1ms  (100 calls)",
       "threshold": "<= 2,000ms",
       "detail": ""
     },
@@ -54,14 +54,14 @@
     {
       "name": "8. Memory evolution",
       "passed": true,
-      "value": "motifs 0->1  confidence 0.45->0.45",
+      "value": "motifs 0->1  confidence 0.42->0.53",
       "threshold": "Motif count grows after resolved remediation",
       "detail": ""
     },
     {
       "name": "9. Multi-seed consistency",
       "passed": true,
-      "value": "4/4 seeds pass",
+      "value": "6/6 seeds pass",
       "threshold": "recall@5 > 0 on all seeds",
       "detail": ""
     },
@@ -75,7 +75,7 @@
     {
       "name": "11. Deep mode (valid Context, p95<=6s)",
       "passed": true,
-      "value": "2ms  explain_len=559",
+      "value": "332ms  explain_len=804",
       "threshold": "Non-empty explain, <= 6,000ms",
       "detail": ""
     }
