@@ -23,6 +23,7 @@ from typing import Any
 
 try:
     import networkx as nx
+
     _NX_AVAILABLE = True
 except ImportError:
     _NX_AVAILABLE = False
@@ -72,15 +73,65 @@ class IncidentMotif:
     Topology-independent representation of an incident.
     Describes WHAT happened (the pattern), not WHERE (the services).
     """
+
     incident_id: str = ""
     canonical_ids: list[str] = field(default_factory=list)
     event_sequence: list[str] = field(default_factory=list)
-    # List of (src_role, dst_role) tuples
-    causal_shape: list[tuple[str, str]] = field(default_factory=list)
+    # List of (src_role, relation_role, dst_role) tuples
+    causal_shape: list[tuple[str, str, str]] = field(default_factory=list)
     remediation_action: str = ""
     remediation_outcome: str = ""
     timestamp: str = ""
     confidence: float = 0.0
+    content_tokens: set[str] = field(default_factory=set)
+
+    def content_fingerprint(self) -> set[str]:
+        """
+        Return cached content tokens if available, otherwise compute fresh.
+        Tokens are set during incident processing and persist through serialization.
+        """
+        # If we have cached tokens, return them
+        if self.content_tokens:
+            return self.content_tokens
+
+        # Otherwise compute from scratch
+        tokens = set()
+
+        # 1. Encode the event sequence pattern
+        if self.event_sequence:
+            seq_str = "_".join(self.event_sequence[:4])  # First 4 event types
+            tokens.add(f"seq:{seq_str}")
+
+        # 2. Extract signal types from sequence
+        for event_type in self.event_sequence:
+            if "error" in event_type.lower():
+                tokens.add("signal:error")
+            elif "metric" in event_type.lower() or "latency" in event_type.lower():
+                tokens.add("signal:metric_anomaly")
+            elif "deploy" in event_type.lower():
+                tokens.add("signal:deploy")
+            elif "trace" in event_type.lower():
+                tokens.add("signal:trace")
+            elif "log" in event_type.lower():
+                tokens.add("signal:log")
+
+        # 3. Encode remediation action
+        if self.remediation_action:
+            tokens.add(f"remedy:{self.remediation_action}")
+
+        # 4. Encode remediation outcome
+        if self.remediation_outcome:
+            tokens.add(f"outcome:{self.remediation_outcome}")
+
+        # 5. Encode causal shape patterns (major relationships)
+        if self.causal_shape:
+            # Count edge types
+            relations = [edge[1] if len(edge) > 1 else "" for edge in self.causal_shape]
+            for rel in set(relations):
+                if rel:
+                    tokens.add(f"edge:{rel}")
+
+        return  # return tokens
 
 
 class OperationalGraph:
@@ -95,9 +146,11 @@ class OperationalGraph:
         if not _NX_AVAILABLE:
             raise ImportError("networkx is required: pip install networkx")
         self.G: nx.DiGraph = nx.DiGraph()
-        self._deploy_log: dict[str, list[dict]] = {}        # cid → [{ts, version}]
-        self._remediation_table: dict[str, list[dict]] = {} # cid → [outcomes]
-        self._signal_log: dict[str, dict[str, dict]] = {}   # cid → {kind → {ts, trace_id, event_id}}
+        self._deploy_log: dict[str, list[dict]] = {}  # cid → [{ts, version}]
+        self._remediation_table: dict[str, list[dict]] = {}  # cid → [outcomes]
+        self._signal_log: dict[
+            str, dict[str, dict]
+        ] = {}  # cid → {kind → {ts, trace_id, event_id}}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -166,7 +219,8 @@ class OperationalGraph:
         try:
             anchor = _parse_ts(anchor_ts)
             candidates = [
-                d for d in deploys
+                d
+                for d in deploys
                 if 0 <= (anchor - _parse_ts(d["ts"])).total_seconds() <= window_s
             ]
             return max(candidates, key=lambda d: d["ts"]) if candidates else None
@@ -199,7 +253,7 @@ class OperationalGraph:
                         # and within a 20-minute lookback window
                         first_seen = _parse_ts(data.get("first_seen", anchor_ts))
                         delta = (anchor - first_seen).total_seconds()
-                        if -60 <= delta <= 1200:   # -60s tolerance for clock skew
+                        if -60 <= delta <= 1200:  # -60s tolerance for clock skew
                             data["confidence"] = min(0.95, data["confidence"] + 0.10)
                             data["remediation_reinforced"] = True
                     except Exception:
@@ -208,13 +262,15 @@ class OperationalGraph:
             # Store remediation outcome
             if cid not in self._remediation_table:
                 self._remediation_table[cid] = []
-            self._remediation_table[cid].append({
-                "action": event.get("action", ""),
-                "target_version": event.get("version"),
-                "outcome": event.get("outcome", "unknown"),
-                "ts": anchor_ts,
-                "incident_id": event.get("incident_id", ""),
-            })
+            self._remediation_table[cid].append(
+                {
+                    "action": event.get("action", ""),
+                    "target_version": event.get("version"),
+                    "outcome": event.get("outcome", "unknown"),
+                    "ts": anchor_ts,
+                    "incident_id": event.get("incident_id", ""),
+                }
+            )
 
     def get_remediations(self, cid: str) -> list[dict]:
         """Return all remediation outcomes for a canonical_id."""
@@ -224,16 +280,22 @@ class OperationalGraph:
     # Signal tracking (for cross-signal edge formation)
     # ------------------------------------------------------------------
 
-    def record_signal(self, cid: str, kind: str, ts: str,
-                      trace_id: str | None, event_id: str) -> None:
+    def record_signal(
+        self, cid: str, kind: str, ts: str, trace_id: str | None, event_id: str
+    ) -> None:
         """Track the most recent signal of each kind per entity."""
         with self._lock:
             if cid not in self._signal_log:
                 self._signal_log[cid] = {}
-            self._signal_log[cid][kind] = {"ts": ts, "trace_id": trace_id, "event_id": event_id}
+            self._signal_log[cid][kind] = {
+                "ts": ts,
+                "trace_id": trace_id,
+                "event_id": event_id,
+            }
 
-    def get_recent_signal(self, cid: str, anchor_ts: str,
-                          kind: str, window_s: int = 300) -> dict | None:
+    def get_recent_signal(
+        self, cid: str, anchor_ts: str, kind: str, window_s: int = 300
+    ) -> dict | None:
         """Return the most recent signal of a given kind for cid within window."""
         entry = self._signal_log.get(cid, {}).get(kind)
         if not entry:
@@ -282,15 +344,18 @@ class OperationalGraph:
                     key = (src, dst)
                     if key not in edges_seen:
                         edges_seen.add(key)
-                        edges.append(CausalEdge(
-                            src_cid=src, dst_cid=dst,
-                            relation=data.get("relation", ""),
-                            confidence=data.get("confidence", 0.0),
-                            count=data.get("count", 1),
-                            first_seen=data.get("first_seen", ""),
-                            last_seen=data.get("last_seen", ""),
-                            evidence_ids=list(data.get("evidence_ids", [])),
-                        ))
+                        edges.append(
+                            CausalEdge(
+                                src_cid=src,
+                                dst_cid=dst,
+                                relation=data.get("relation", ""),
+                                confidence=data.get("confidence", 0.0),
+                                count=data.get("count", 1),
+                                first_seen=data.get("first_seen", ""),
+                                last_seen=data.get("last_seen", ""),
+                                evidence_ids=list(data.get("evidence_ids", [])),
+                            )
+                        )
                     if dst not in visited:
                         queue.append((dst, depth + 1))
 
@@ -301,15 +366,18 @@ class OperationalGraph:
                     key = (src, dst)
                     if key not in edges_seen:
                         edges_seen.add(key)
-                        edges.append(CausalEdge(
-                            src_cid=src, dst_cid=dst,
-                            relation=data.get("relation", ""),
-                            confidence=data.get("confidence", 0.0),
-                            count=data.get("count", 1),
-                            first_seen=data.get("first_seen", ""),
-                            last_seen=data.get("last_seen", ""),
-                            evidence_ids=list(data.get("evidence_ids", [])),
-                        ))
+                        edges.append(
+                            CausalEdge(
+                                src_cid=src,
+                                dst_cid=dst,
+                                relation=data.get("relation", ""),
+                                confidence=data.get("confidence", 0.0),
+                                count=data.get("count", 1),
+                                first_seen=data.get("first_seen", ""),
+                                last_seen=data.get("last_seen", ""),
+                                evidence_ids=list(data.get("evidence_ids", [])),
+                            )
+                        )
                     if src not in visited:
                         queue.append((src, depth + 1))
 
@@ -351,7 +419,9 @@ class OperationalGraph:
         triples — richer than just (src, dst) pairs, enabling family discrimination.
         """
         motif = IncidentMotif()
-        motif.canonical_ids = list({e.src_cid for e in edges} | {e.dst_cid for e in edges})
+        motif.canonical_ids = list(
+            {e.src_cid for e in edges} | {e.dst_cid for e in edges}
+        )
 
         # Assign stable role labels to each canonical_id in this incident
         # Role is determined by the relations it participates in
@@ -390,7 +460,15 @@ class OperationalGraph:
         n_edges = len(edges)
         has_self_loop = any(e.src_cid == e.dst_cid for e in edges)
         # Bin node count: "solo", "pair", "trio", "multi"
-        node_bin = "solo" if n_nodes <= 1 else "pair" if n_nodes == 2 else "trio" if n_nodes == 3 else "multi"
+        node_bin = (
+            "solo"
+            if n_nodes <= 1
+            else "pair"
+            if n_nodes == 2
+            else "trio"
+            if n_nodes == 3
+            else "multi"
+        )
         # Bin edge count: "sparse", "moderate", "dense"
         edge_bin = "sparse" if n_edges <= 2 else "moderate" if n_edges <= 5 else "dense"
 
@@ -424,7 +502,9 @@ class OperationalGraph:
                     last = _parse_ts(data.get("last_seen", now_ts))
                     days_old = (now - last).days
                     if days_old > 0:
-                        data["confidence"] = max(0.1, data["confidence"] - 0.01 * days_old)
+                        data["confidence"] = max(
+                            0.1, data["confidence"] - 0.01 * days_old
+                        )
                 except Exception:
                     pass
 
@@ -434,12 +514,15 @@ class OperationalGraph:
 
     def save(self, path: str) -> None:
         with open(path, "wb") as f:
-            pickle.dump({
-                "graph": self.G,
-                "deploy_log": self._deploy_log,
-                "remediation_table": self._remediation_table,
-                "signal_log": self._signal_log,
-            }, f)
+            pickle.dump(
+                {
+                    "graph": self.G,
+                    "deploy_log": self._deploy_log,
+                    "remediation_table": self._remediation_table,
+                    "signal_log": self._signal_log,
+                },
+                f,
+            )
 
     def load(self, path: str) -> None:
         with open(path, "rb") as f:
@@ -454,12 +537,18 @@ class OperationalGraph:
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _relation_to_role(relation: str) -> str:
     """Map a relation string to an abstract role label for motif encoding."""
     relation = relation.lower()
     if "deploy" in relation:
         return "DEPLOY"
-    if "metric" in relation or "latency" in relation or "spike" in relation or "threshold" in relation:
+    if (
+        "metric" in relation
+        or "latency" in relation
+        or "spike" in relation
+        or "threshold" in relation
+    ):
         return "METRIC_ANOMALY"
     if "error_log" in relation or ("log" in relation and "error" in relation):
         return "ERROR_LOG"

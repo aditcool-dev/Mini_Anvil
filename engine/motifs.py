@@ -1,5 +1,4 @@
-"""
-Behavioral Motif Index
+"""Behavioral Motif Index
 
 Stores abstract behavioral fingerprints of past incidents, independent of
 service names or topology. This is what makes recall@5 work across renames.
@@ -12,6 +11,7 @@ Similarity = weighted combination of:
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass, field
 
@@ -73,7 +73,7 @@ class BehavioralMotifIndex:
             if not self._motifs:
                 return []
 
-            scored: list[tuple[float, IncidentMotif]] = []
+            scored: list[tuple[float, IncidentMotif, str]] = []
             for stored in self._motifs:
                 score, rationale = _compute_similarity(query_motif, stored)
                 scored.append((score, stored, rationale))
@@ -102,10 +102,64 @@ class BehavioralMotifIndex:
         with self._lock:
             return list(self._motifs)
 
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Persist motifs to a JSON file."""
+        with self._lock:
+            data = []
+            for motif in self._motifs:
+                # Serialize IncidentMotif to dict
+                motif_dict = {
+                    "incident_id": motif.incident_id,
+                    "canonical_ids": list(motif.canonical_ids),
+                    "event_sequence": motif.event_sequence,
+                    "causal_shape": [list(edge) for edge in motif.causal_shape],
+                    "remediation_action": motif.remediation_action,
+                    "remediation_outcome": motif.remediation_outcome,
+                    "timestamp": motif.timestamp,
+                    "content_tokens": list(motif.content_tokens)
+                    if motif.content_tokens
+                    else [],
+                }
+                data.append(motif_dict)
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "BehavioralMotifIndex":
+        """Load motifs from a JSON file."""
+        index = cls()
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            for item in data:
+                # Reconstruct IncidentMotif from dict
+                motif = IncidentMotif(
+                    incident_id=item.get("incident_id", ""),
+                    canonical_ids=list(item.get("canonical_ids", [])),
+                    event_sequence=item.get("event_sequence", []),
+                    causal_shape=[tuple(edge) for edge in item.get("causal_shape", [])],
+                    remediation_action=item.get("remediation_action", ""),
+                    remediation_outcome=item.get("remediation_outcome", ""),
+                    timestamp=item.get("timestamp", ""),
+                )
+                # Restore content tokens if available
+                if "content_tokens" in item:
+                    motif.content_tokens = set(item["content_tokens"])
+                index._motifs.append(motif)
+        except FileNotFoundError:
+            # If file doesn't exist, just return empty index
+            pass
+        return index
+
 
 # ------------------------------------------------------------------
 # Similarity computation
 # ------------------------------------------------------------------
+
 
 def _jaccard(a: list | set, b: list | set) -> float:
     """Jaccard similarity between two sets."""
@@ -127,8 +181,9 @@ def _compute_similarity(
 
     Weights:
       0.45 — causal shape (3-tuple structural similarity) — primary discriminator
-      0.35 — event sequence Jaccard — secondary
-      0.20 — remediation action match — bonus
+      0.30 — event sequence Jaccard — secondary
+      0.15 — remediation action match — bonus
+      0.10 — sequence order similarity
     """
     # 1. Causal shape similarity — edge set Jaccard on (src_role, relation, dst_role) triples
     # Handles both 2-tuple (legacy) and 3-tuple shapes
@@ -149,10 +204,24 @@ def _compute_similarity(
         action_match = 1.0
 
     # 4. Sequence order similarity bonus — penalize if order is very different
-    order_bonus = _sequence_order_similarity(query.event_sequence, stored.event_sequence)
+    order_bonus = _sequence_order_similarity(
+        query.event_sequence, stored.event_sequence
+    )
 
     # Weights: shape is the primary discriminator, action_match is a strong hard bonus
     score = 0.45 * shape_sim + 0.30 * seq_sim + 0.15 * action_match + 0.10 * order_bonus
+
+    # EXPERIMENTAL: Add minimal content fingerprint signal (0.00 for now, can tune to 0.05-0.10)
+    # Disabled by default to preserve recall; uncomment the lines below to enable with weight ~0.05
+    # fp1 = query.content_fingerprint()
+    # fp2 = stored.content_fingerprint()
+    # if fp1 and fp2:
+    #     intersection = len(fp1 & fp2)
+    #     union = len(fp1 | fp2)
+    #     content_sim = intersection / union if union > 0 else 0.5
+    # else:
+    #     content_sim = 0.5
+    # score = score * 0.95 + 0.05 * content_sim  # Add 5% content signal to baseline
 
     # Build rationale
     parts = []

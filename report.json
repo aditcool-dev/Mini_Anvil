@@ -5,9 +5,9 @@
     {
       "name": "1. Ingest throughput",
       "passed": true,
-      "value": "2524 ev/s",
+      "value": "3128 ev/s",
       "threshold": ">= 1,000 ev/s",
-      "detail": "Ingested 5000 events in 1.981s"
+      "detail": "Ingested 5000 events in 1.599s"
     },
     {
       "name": "2. Output schema validation",
@@ -33,7 +33,7 @@
     {
       "name": "5. Fast mode p95 latency",
       "passed": true,
-      "value": "p95=2ms  p50=1ms  (100 calls)",
+      "value": "p95=3ms  p50=3ms  (100 calls)",
       "threshold": "<= 2,000ms",
       "detail": ""
     },
@@ -75,7 +75,7 @@
     {
       "name": "11. Deep mode (valid Context, p95<=6s)",
       "passed": true,
-      "value": "353ms  explain_len=792",
+      "value": "140ms  explain_len=792",
       "threshold": "Non-empty explain, <= 6,000ms",
       "detail": ""
     }

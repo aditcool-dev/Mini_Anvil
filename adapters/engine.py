@@ -12,6 +12,7 @@ Architecture:
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
 from typing import Iterable, Literal
@@ -32,11 +33,40 @@ class Engine:
     - reconstruct_context() is read-only and concurrent-safe
     """
 
-    def __init__(self) -> None:
-        self.resolver = IdentityResolver()
-        self.store = EventStore()           # DuckDB in-process
-        self.graph = OperationalGraph()     # NetworkX DiGraph
-        self.motifs = BehavioralMotifIndex()
+    def __init__(self, persist_dir: str = ".") -> None:
+        """Initialize engine with optional persistence.
+
+        Args:
+            persist_dir: Directory for storing persistent state files.
+                        If ".", will save/load from current directory.
+        """
+        self.persist_dir = persist_dir
+
+        # Try to load persisted state, else create new
+        identity_path = os.path.join(persist_dir, "identity.json")
+        graph_path = os.path.join(persist_dir, "graph.pkl")
+        motifs_path = os.path.join(persist_dir, "motifs.json")
+
+        if os.path.exists(identity_path):
+            self.resolver = IdentityResolver.load(identity_path)
+        else:
+            self.resolver = IdentityResolver()
+
+        # EventStore always creates fresh (file-backed at persist_dir)
+        events_db = os.path.join(persist_dir, "events.db")
+        self.store = EventStore(db_path=events_db)
+
+        if os.path.exists(graph_path):
+            self.graph = OperationalGraph()
+            self.graph.load(graph_path)
+        else:
+            self.graph = OperationalGraph()
+
+        if os.path.exists(motifs_path):
+            self.motifs = BehavioralMotifIndex.load(motifs_path)
+        else:
+            self.motifs = BehavioralMotifIndex()
+
         self.assembler = ContextAssembler()
         self._lock = threading.Lock()
         self._open_incidents: dict[str, dict] = {}
@@ -66,7 +96,9 @@ class Engine:
             # Resolve all canonical_ids and prepare batch insert rows
             batch_rows: list[tuple] = []
             for event in other_events:
-                service = event.get("service", event.get("svc", event.get("target", "")))
+                service = event.get(
+                    "service", event.get("svc", event.get("target", ""))
+                )
                 if not service:
                     continue
                 cid = self.resolver.resolve(service)
@@ -82,7 +114,9 @@ class Engine:
 
             # Process graph/motif updates (non-storage logic)
             for event in other_events:
-                service = event.get("service", event.get("svc", event.get("target", "")))
+                service = event.get(
+                    "service", event.get("svc", event.get("target", ""))
+                )
                 if not service:
                     continue
                 cid = self.resolver.resolve(service)
@@ -112,7 +146,9 @@ class Engine:
         ts = event.get("ts", "")
 
         if kind == "rename" or "rename" in str(mutation):
-            old_name = mutation_dict.get("old_name", mutation_dict.get("from", mutation_dict.get("from_", "")))
+            old_name = mutation_dict.get(
+                "old_name", mutation_dict.get("from", mutation_dict.get("from_", ""))
+            )
             new_name = mutation_dict.get("new_name", mutation_dict.get("to", ""))
             if old_name and new_name:
                 self.resolver.rename(old_name, new_name, ts)
@@ -220,7 +256,9 @@ class Engine:
         # 2. metric → log: if this is an error log, link from the most recent
         #    metric anomaly on the same entity (within 5 minutes)
         if kind == "log" and event.get("level") in ("error", "critical", "fatal"):
-            recent_metric = self.graph.get_recent_signal(cid, ts, kind="metric", window_s=300)
+            recent_metric = self.graph.get_recent_signal(
+                cid, ts, kind="metric", window_s=300
+            )
             if recent_metric:
                 self.graph.add_edge(
                     src_cid=cid,
@@ -327,4 +365,16 @@ class Engine:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        self.store.close()
+        """Shutdown and persist all state."""
+        try:
+            identity_path = os.path.join(self.persist_dir, "identity.json")
+            graph_path = os.path.join(self.persist_dir, "graph.pkl")
+            motifs_path = os.path.join(self.persist_dir, "motifs.json")
+
+            self.resolver.save(identity_path)
+            self.graph.save(graph_path)
+            self.motifs.save(motifs_path)
+        except Exception:
+            pass  # Graceful fallback if persistence fails
+        finally:
+            self.store.close()

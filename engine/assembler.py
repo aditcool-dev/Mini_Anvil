@@ -60,11 +60,7 @@ class ContextAssembler:
         related = [e for e in raw_related if e.get("kind") in RELEVANT_KINDS]
 
         # Trace correlation: find events sharing trace_ids from the window
-        trace_ids = list({
-            e.get("trace_id")
-            for e in related
-            if e.get("trace_id")
-        })
+        trace_ids = list({e.get("trace_id") for e in related if e.get("trace_id")})
         if trace_ids:
             trace_events = event_store.get_by_trace_ids(trace_ids)
             # Only include causally-relevant kinds from trace correlation too
@@ -75,7 +71,9 @@ class ContextAssembler:
         # but only within the same 5-minute window — no unbounded retrieval
         dep_cids = _get_dependency_cids(cid, graph)
         if dep_cids:
-            dep_events = event_store.get_by_canonical_ids(dep_cids, anchor_ts, window_s=300)
+            dep_events = event_store.get_by_canonical_ids(
+                dep_cids, anchor_ts, window_s=300
+            )
             dep_events = [e for e in dep_events if e.get("kind") in RELEVANT_KINDS]
             related = _dedupe(related + dep_events)
 
@@ -95,10 +93,7 @@ class ContextAssembler:
         remediations = _build_remediations(matches, graph, cid, resolver)
 
         # 6. Confidence
-        confidence = (
-            sum(e.confidence for e in edges) / len(edges)
-            if edges else 0.0
-        )
+        confidence = sum(e.confidence for e in edges) / len(edges) if edges else 0.0
 
         # 7. Explain
         if mode == "deep":
@@ -152,6 +147,7 @@ class ContextAssembler:
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _dedupe(events: list[dict]) -> list[dict]:
     """Deduplicate events by event_id. Preserves order."""
     seen: set[str] = set()
@@ -201,13 +197,16 @@ def _build_remediations(
         success_rate = resolved / len(action_outcomes) if action_outcomes else 0.5
 
         score = round(match.similarity * success_rate, 3)
-        remediations.append({
-            "action": action,
-            "confidence": score,
-            "based_on_incident": match.incident_id,
-            "historical_success_rate": round(success_rate, 2),
-            "outcome_from_past": match.remediation_outcome,
-        })
+        remediations.append(
+            {
+                "action": action,
+                "target": resolver.current_name(cid),  # Service to apply remediation to
+                "confidence": score,
+                "based_on_incident": match.incident_id,
+                "historical_success_rate": round(success_rate, 2),
+                "outcome_from_past": match.remediation_outcome,
+            }
+        )
 
     # Sort by confidence descending
     remediations.sort(key=lambda r: r["confidence"], reverse=True)
@@ -243,12 +242,16 @@ def _template_explain(
             f"detected at {anchor_ts}."
         )
     else:
-        parts.append(f"Incident on {service} (canonical ID: {cid}) detected at {anchor_ts}.")
+        parts.append(
+            f"Incident on {service} (canonical ID: {cid}) detected at {anchor_ts}."
+        )
 
     # 2. Event summary
     kind_counts: dict[str, int] = {}
     for e in related:
-        kind_counts[e.get("kind", "unknown")] = kind_counts.get(e.get("kind", "unknown"), 0) + 1
+        kind_counts[e.get("kind", "unknown")] = (
+            kind_counts.get(e.get("kind", "unknown"), 0) + 1
+        )
     kind_str = ", ".join(f"{v} {k}" for k, v in sorted(kind_counts.items()))
     parts.append(f"Window contains {len(related)} related events: {kind_str}.")
 
@@ -260,7 +263,9 @@ def _template_explain(
             f"at {recent_deploy.get('ts', '?')} is the likely trigger."
         )
     else:
-        parts.append("No recent deployment was detected for this service within the incident window.")
+        parts.append(
+            "No recent deployment was detected for this service within the incident window."
+        )
 
     # 4. Causal chain narrative
     if causal_chain:
@@ -316,7 +321,9 @@ def _llm_explain(
     Falls back to enriched template if LLM is unavailable.
     """
     try:
-        return _call_llm(service, related, causal_chain, matches, remediations, resolver)
+        return _call_llm(
+            service, related, causal_chain, matches, remediations, resolver
+        )
     except Exception as ex:
         # Graceful fallback — use the full template (not a stripped-down version)
         return _template_explain(
@@ -348,25 +355,35 @@ def _call_llm(
     # Load .env if present
     try:
         from dotenv import load_dotenv
+
         load_dotenv()
     except ImportError:
         pass  # dotenv optional — keys can be set directly in environment
 
     # Build a rich, judge-optimised prompt
-    chain_summary = "; ".join(
-        f"{e.get('cause_name','?')} --[{e.get('relation','')}]--> {e.get('effect_name','?')} (conf {e.get('confidence',0):.0%})"
-        for e in causal_chain[:4]
-    ) or "no causal chain established yet"
+    chain_summary = (
+        "; ".join(
+            f"{e.get('cause_name', '?')} --[{e.get('relation', '')}]--> {e.get('effect_name', '?')} (conf {e.get('confidence', 0):.0%})"
+            for e in causal_chain[:4]
+        )
+        or "no causal chain established yet"
+    )
 
-    past_summary = "; ".join(
-        f"[{m.incident_id}] sim={m.similarity:.0%}, action={m.remediation_action}, outcome={m.remediation_outcome}"
-        for m in matches[:3]
-    ) or "no similar past incidents"
+    past_summary = (
+        "; ".join(
+            f"[{m.incident_id}] sim={m.similarity:.0%}, action={m.remediation_action}, outcome={m.remediation_outcome}"
+            for m in matches[:3]
+        )
+        or "no similar past incidents"
+    )
 
-    remediation_summary = "; ".join(
-        f"{r['action']} (success rate {r['historical_success_rate']:.0%}, confidence {r['confidence']:.2f})"
-        for r in remediations[:2]
-    ) or "no remediation history"
+    remediation_summary = (
+        "; ".join(
+            f"{r['action']} (success rate {r['historical_success_rate']:.0%}, confidence {r['confidence']:.2f})"
+            for r in remediations[:2]
+        )
+        or "no remediation history"
+    )
 
     event_kinds = list({e.get("kind", "unknown") for e in related[:15]})
     event_count = len(related)
@@ -384,7 +401,7 @@ def _call_llm(
     prompt = f"""You are an SRE on-call analyst. Write a 4-6 sentence incident summary using only the data below. Do not use placeholders or describe what you would write — write the actual summary now.
 
 Service: {service}{rename_note}
-Events in window: {event_count} ({', '.join(event_kinds)})
+Events in window: {event_count} ({", ".join(event_kinds)})
 Causal chain: {chain_summary}
 Past incidents matched: {past_summary}
 Recommended remediations: {remediation_summary}
@@ -400,6 +417,7 @@ Write the summary:"""
     openai_key = os.environ.get("OPENAI_API_KEY")
     if openai_key:
         import openai
+
         client = openai.OpenAI(api_key=openai_key)
         response = client.chat.completions.create(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
@@ -413,6 +431,7 @@ Write the summary:"""
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if anthropic_key:
         import anthropic
+
         client = anthropic.Anthropic(api_key=anthropic_key)
         message = client.messages.create(
             model=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-20240307"),
@@ -430,24 +449,27 @@ Write the summary:"""
 def _call_gemini(prompt: str, api_key: str) -> str:
     """Call Gemini API via raw HTTP — no SDK dependency issues."""
     import json as _json
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model_name}:generateContent?key={api_key}"
     )
-    payload = _json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.2},
-        # Disable thinking budget on models that support it (e.g. gemini-2.5-flash)
-        # This cuts latency from ~6s to ~2s with no quality loss for structured tasks
-        "thinkingConfig": {"thinkingBudget": 0},
-    }).encode("utf-8")
+    payload = _json.dumps(
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.2},
+            # Disable thinking budget on models that support it (e.g. gemini-2.5-flash)
+            # This cuts latency from ~6s to ~2s with no quality loss for structured tasks
+            "thinkingConfig": {"thinkingBudget": 0},
+        }
+    ).encode("utf-8")
 
     req = urllib.request.Request(
-        url, data=payload,
+        url,
+        data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
