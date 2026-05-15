@@ -58,6 +58,9 @@ class CausalEdge:
             "effect_name": resolver.current_name(self.dst_cid),
             "relation": self.relation,
             "confidence": round(self.confidence, 3),
+            # Timestamps for temporal ordering validation
+            "cause_ts": self.first_seen,
+            "effect_ts": self.last_seen,
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
         }
@@ -281,21 +284,41 @@ class OperationalGraph:
         """
         Convert causal chain to topology-independent behavioral fingerprint.
         Replaces canonical_ids with role labels based on relation type.
+
+        The motif shape encodes the FULL causal path as (src_role, relation_role, dst_role)
+        triples — richer than just (src, dst) pairs, enabling family discrimination.
         """
         motif = IncidentMotif()
         motif.canonical_ids = list({e.src_cid for e in edges} | {e.dst_cid for e in edges})
 
-        # Build abstract event sequence from relation types
-        seen_relations: list[str] = []
+        # Assign stable role labels to each canonical_id in this incident
+        # Role is determined by the relations it participates in
+        cid_roles: dict[str, str] = {}
         for edge in edges:
-            role = _relation_to_role(edge.relation)
-            if role not in seen_relations:
-                seen_relations.append(role)
-        motif.event_sequence = seen_relations
+            src_role = _cid_to_role(edge.src_cid, edge.relation, is_src=True)
+            dst_role = _cid_to_role(edge.dst_cid, edge.relation, is_src=False)
+            # First assignment wins (most upstream role)
+            if edge.src_cid not in cid_roles:
+                cid_roles[edge.src_cid] = src_role
+            if edge.dst_cid not in cid_roles:
+                cid_roles[edge.dst_cid] = dst_role
 
-        # Build causal shape as (src_role, dst_role) pairs
+        # Build abstract event sequence: ordered list of unique role transitions
+        seen: list[str] = []
+        for edge in edges:
+            rel_role = _relation_to_role(edge.relation)
+            if rel_role not in seen:
+                seen.append(rel_role)
+        motif.event_sequence = seen
+
+        # Build causal shape as (src_role, relation_role, dst_role) triples
+        # This is the key discriminator between incident families
         motif.causal_shape = [
-            (_relation_to_role(e.relation) + "_SRC", _relation_to_role(e.relation) + "_DST")
+            (
+                cid_roles.get(e.src_cid, "UNKNOWN"),
+                _relation_to_role(e.relation),
+                cid_roles.get(e.dst_cid, "UNKNOWN"),
+            )
             for e in edges
         ]
 
@@ -350,18 +373,47 @@ class OperationalGraph:
 # ------------------------------------------------------------------
 
 def _relation_to_role(relation: str) -> str:
-    """Map a relation string to an abstract role label."""
+    """Map a relation string to an abstract role label for motif encoding."""
     relation = relation.lower()
     if "deploy" in relation:
         return "DEPLOY"
-    if "metric" in relation or "latency" in relation or "spike" in relation:
+    if "metric" in relation or "latency" in relation or "spike" in relation or "threshold" in relation:
         return "METRIC_ANOMALY"
-    if "log" in relation or "error" in relation:
+    if "error_log" in relation or ("log" in relation and "error" in relation):
         return "ERROR_LOG"
-    if "trace" in relation or "upstream" in relation or "call" in relation:
+    if "upstream" in relation or "call" in relation:
         return "UPSTREAM_CALL"
+    if "trace" in relation:
+        return "TRACE_CORRELATION"
     if "incident" in relation:
         return "INCIDENT"
-    if "remediation" in relation or "rollback" in relation or "restart" in relation:
+    if "rollback" in relation:
+        return "ROLLBACK"
+    if "restart" in relation:
+        return "RESTART"
+    if "config" in relation:
+        return "CONFIG_CHANGE"
+    if "remediation" in relation:
         return "REMEDIATION"
+    if "log" in relation:
+        return "LOG_SIGNAL"
     return "SIGNAL"
+
+
+def _cid_to_role(cid: str, relation: str, is_src: bool) -> str:
+    """
+    Assign a structural role to a canonical_id based on its position in a relation.
+    This makes motif shapes topology-independent.
+    """
+    rel = relation.lower()
+    if "deploy" in rel:
+        return "DEPLOY_TARGET" if is_src else "DEPLOY_EFFECT"
+    if "upstream" in rel or "call" in rel:
+        return "CALLER" if is_src else "CALLEE"
+    if "metric" in rel or "latency" in rel:
+        return "METRIC_SOURCE" if is_src else "METRIC_EFFECT"
+    if "error" in rel or "log" in rel:
+        return "LOG_SOURCE" if is_src else "LOG_EFFECT"
+    if "trace" in rel:
+        return "TRACE_ROOT" if is_src else "TRACE_SPAN"
+    return "SOURCE" if is_src else "EFFECT"

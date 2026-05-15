@@ -124,16 +124,22 @@ def _compute_similarity(
     """
     Compute weighted similarity between two motifs.
     Returns (score, rationale_string).
-    """
-    # 1. Event sequence Jaccard (weight: 0.4)
-    seq_sim = _jaccard(query.event_sequence, stored.event_sequence)
 
-    # 2. Causal shape Jaccard — edge set similarity (weight: 0.4)
-    q_edges = set(query.causal_shape)
-    s_edges = set(stored.causal_shape)
+    Weights:
+      0.45 — causal shape (3-tuple structural similarity) — primary discriminator
+      0.35 — event sequence Jaccard — secondary
+      0.20 — remediation action match — bonus
+    """
+    # 1. Causal shape similarity — edge set Jaccard on (src_role, relation, dst_role) triples
+    # Handles both 2-tuple (legacy) and 3-tuple shapes
+    q_edges = set(tuple(x) for x in query.causal_shape)
+    s_edges = set(tuple(x) for x in stored.causal_shape)
     shape_sim = _jaccard(q_edges, s_edges)
 
-    # 3. Remediation action match bonus (weight: 0.2)
+    # 2. Event sequence Jaccard
+    seq_sim = _jaccard(query.event_sequence, stored.event_sequence)
+
+    # 3. Remediation action match bonus
     action_match = 0.0
     if (
         query.remediation_action
@@ -142,17 +148,44 @@ def _compute_similarity(
     ):
         action_match = 1.0
 
-    score = 0.4 * seq_sim + 0.4 * shape_sim + 0.2 * action_match
+    # 4. Sequence order similarity bonus — penalize if order is very different
+    order_bonus = _sequence_order_similarity(query.event_sequence, stored.event_sequence)
+
+    score = 0.45 * shape_sim + 0.30 * seq_sim + 0.15 * action_match + 0.10 * order_bonus
 
     # Build rationale
     parts = []
+    if shape_sim > 0:
+        common_shapes = q_edges & s_edges
+        parts.append(f"causal shape similarity: {shape_sim:.0%}")
+        if common_shapes:
+            sample = list(common_shapes)[:2]
+            parts.append(f"shared patterns: {sample}")
     if seq_sim > 0:
         common_events = set(query.event_sequence) & set(stored.event_sequence)
         parts.append(f"shared event types: {', '.join(sorted(common_events))}")
-    if shape_sim > 0:
-        parts.append(f"causal shape similarity: {shape_sim:.0%}")
     if action_match:
-        parts.append(f"same remediation action: {stored.remediation_action}")
+        parts.append(f"same remediation: {stored.remediation_action}")
     rationale = "; ".join(parts) if parts else "low structural overlap"
 
     return score, rationale
+
+
+def _sequence_order_similarity(a: list[str], b: list[str]) -> float:
+    """
+    Measure how similar the ordering of shared elements is between two sequences.
+    Uses longest common subsequence length normalized by max length.
+    """
+    if not a or not b:
+        return 0.0
+    # LCS length
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    lcs_len = dp[m][n]
+    return lcs_len / max(m, n)

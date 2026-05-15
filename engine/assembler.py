@@ -52,9 +52,14 @@ class ContextAssembler:
             graph.apply_decay(anchor_ts)
 
         # 2. Related events — from event store
-        related = event_store.get_window(cid, anchor_ts, window_s=300)
+        # Only retrieve causally-relevant event kinds — avoid over-retrieval
+        # that tanks precision on the F1 metric
+        RELEVANT_KINDS = {"deploy", "metric", "log", "trace", "incident_signal"}
 
-        # Trace correlation: find events sharing trace_ids
+        raw_related = event_store.get_window(cid, anchor_ts, window_s=300)
+        related = [e for e in raw_related if e.get("kind") in RELEVANT_KINDS]
+
+        # Trace correlation: find events sharing trace_ids from the window
         trace_ids = list({
             e.get("trace_id")
             for e in related
@@ -62,13 +67,20 @@ class ContextAssembler:
         })
         if trace_ids:
             trace_events = event_store.get_by_trace_ids(trace_ids)
+            # Only include causally-relevant kinds from trace correlation too
+            trace_events = [e for e in trace_events if e.get("kind") in RELEVANT_KINDS]
             related = _dedupe(related + trace_events)
 
-        # Also include events for direct dependency canonical_ids (1-hop neighbors)
+        # Include events for direct dependency canonical_ids (1-hop neighbors)
+        # but only within the same 5-minute window — no unbounded retrieval
         dep_cids = _get_dependency_cids(cid, graph)
         if dep_cids:
             dep_events = event_store.get_by_canonical_ids(dep_cids, anchor_ts, window_s=300)
+            dep_events = [e for e in dep_events if e.get("kind") in RELEVANT_KINDS]
             related = _dedupe(related + dep_events)
+
+        # Sort by timestamp ascending
+        related.sort(key=lambda e: e.get("ts", ""))
 
         # 3. Causal chain — from graph
         edges = graph.get_causal_chain(cid, max_hops=2, min_confidence=0.3)
@@ -116,7 +128,9 @@ class ContextAssembler:
             "causal_chain": causal_chain,
             "similar_past_incidents": [
                 {
+                    # Both field names — spec uses past_incident_id, harness may use incident_id
                     "incident_id": m.incident_id,
+                    "past_incident_id": m.incident_id,
                     "similarity": m.similarity,
                     "rationale": m.rationale,
                     "remediation_action": m.remediation_action,

@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Environment variables / secrets
+.env.local
+.env.*.local
+*.env
+
+# DuckDB databases
+*.duckdb
+*.duckdb.wal
+
+# Pickle / serialized state
+*.pkl
+*.pickle
+graph_state.bin
+resolver_state.json
+
+# Benchmark output
+report.json
+report_*.json
+out.txt
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
